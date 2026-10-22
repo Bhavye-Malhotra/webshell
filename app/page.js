@@ -17,9 +17,20 @@ export default function Home() {
 
   const [status, setStatus] = useState('connecting'); // connecting | connected | exited
   const [backend, setBackend] = useState('…');
-  const [transport, setTransport] = useState('ws');   // ws | sse (UI mirror)
+  const [transport, setTransport] = useState('ws');   // ws | sse | exec (UI mirror)
   const [overlay, setOverlay] = useState(null);       // { title, detail }
   const [termSize, setTermSize] = useState({ cols: 80, rows: 24 });
+
+  // ---- exec-mode state (line-based shell for managed hosts) ----------------
+  const execRef = useRef({
+    cwd: '',
+    home: '',
+    line: '',
+    busy: false,
+    history: [],
+    historyIdx: -1,
+    abort: null,
+  });
 
   // ---- Sending input / resize over whichever transport is live -------------
   const sendInput = useCallback((data) => {
@@ -59,6 +70,180 @@ export default function Home() {
     sseIdRef.current = null;
     sessionAliveRef.current = false;
   }, []);
+
+  // ---- exec-mode transport (works on managed/serverless hosts) -------------
+  const shortCwd = (cwd) => {
+    const home = execRef.current.home;
+    if (home && cwd.startsWith(home)) {
+      const rest = cwd.slice(home.length);
+      return rest === '' ? '~' : '~' + rest;
+    }
+    return cwd;
+  };
+
+  const writePrompt = useCallback(() => {
+    const e = execRef.current;
+    const p = `\r\n\x1b[36m${shortCwd(e.cwd)}\x1b[0m \x1b[32m❯\x1b[0m `;
+    termRef.current?.write(p);
+  }, []);
+
+  const runCommand = useCallback(async (cmd) => {
+    const e = execRef.current;
+    const term = termRef.current;
+    if (!term) return;
+    e.busy = true;
+    e.abort = new AbortController();
+
+    try {
+      const res = await fetch('/api/exec', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command: cmd, cwd: e.cwd }),
+        signal: e.abort.signal,
+      });
+      if (!res.ok || !res.body) {
+        term.write(`\x1b[31mexec error: HTTP ${res.status}\x1b[0m\r\n`);
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let pending = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        pending += dec.decode(value, { stream: true });
+        let idx;
+        while ((idx = pending.indexOf('\n')) !== -1) {
+          const line = pending.slice(0, idx);
+          pending = pending.slice(idx + 1);
+          let msg;
+          try { msg = JSON.parse(line); } catch { continue; }
+          if (msg.type === 'data') term.write(msg.data);
+          if (msg.type === 'done') {
+            if (msg.cwd) e.cwd = msg.cwd;
+            if (msg.home) e.home = msg.home;
+            if (msg.error) term.write(`\x1b[31m${msg.error}\x1b[0m\r\n`);
+            if (msg.exitCode !== 0) term.write(`\x1b[2m[exit ${msg.exitCode}]\x1b[0m\r\n`);
+          }
+        }
+      }
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        term.write(`\x1b[31m${err.message}\x1b[0m\r\n`);
+      } else {
+        term.write('^C\r\n');
+      }
+    } finally {
+      e.busy = false;
+      e.abort = null;
+      writePrompt();
+    }
+  }, [writePrompt]);
+
+  const handleExecKey = useCallback((data) => {
+    const e = execRef.current;
+    const term = termRef.current;
+    if (!term) return;
+
+    if (e.busy) {
+      if (data === '\u0003' && e.abort) e.abort.abort(); // ctrl-c aborts
+      return;
+    }
+
+    if (data === '\r') {
+      const cmd = e.line.trim();
+      e.line = '';
+      e.historyIdx = -1;
+      term.write('\r\n');
+      if (cmd) {
+        if (e.history[e.history.length - 1] !== cmd) e.history.push(cmd);
+        if (cmd === 'clear' || cmd === 'cls') {
+          term.clear();
+          writePrompt();
+        } else if (cmd === 'exit') {
+          term.write('This is an exec-mode shell — there is no session to exit.\r\n');
+          writePrompt();
+        } else {
+          runCommand(cmd);
+        }
+      } else {
+        writePrompt();
+      }
+      return;
+    }
+
+    if (data === '\u007f') { // backspace
+      if (e.line.length > 0) {
+        e.line = e.line.slice(0, -1);
+        term.write('\b \b');
+      }
+      return;
+    }
+
+    if (data === '\u0003') { // ctrl-c clears the line
+      e.line = '';
+      term.write('^C\r\n');
+      writePrompt();
+      return;
+    }
+
+    if (data === '\u001b[A' || data === '\u001b[B') { // up/down history
+      if (e.history.length === 0) return;
+      if (data === '\u001b[A') {
+        e.historyIdx = e.historyIdx === -1 ? e.history.length - 1 : Math.max(0, e.historyIdx - 1);
+      } else {
+        if (e.historyIdx === -1) return;
+        e.historyIdx += 1;
+        if (e.historyIdx >= e.history.length) { e.historyIdx = -1; e.line = ''; }
+      }
+      const hist = e.historyIdx === -1 ? '' : e.history[e.historyIdx];
+      term.write('\r\x1b[K');
+      writePromptSameLine();
+      term.write(hist);
+      e.line = hist;
+      return;
+    }
+
+    if (data === '\u001b[C' || data === '\u001b[D' || data === '\u001b[H' || data === '\u001b[F') {
+      return; // no mid-line editing in exec mode
+    }
+
+    if (data >= ' ' || data === '\t') {
+      e.line += data === '\t' ? '  ' : data;
+      term.write(data === '\t' ? '  ' : data);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runCommand, writePrompt]);
+
+  const writePromptSameLine = useCallback(() => {
+    const e = execRef.current;
+    termRef.current?.write(`\x1b[36m${shortCwd(e.cwd)}\x1b[0m \x1b[32m❯\x1b[0m `);
+  }, []);
+
+  const connectExec = useCallback(async () => {
+    transportRef.current = 'exec';
+    setTransport('exec');
+    setStatus('connecting');
+
+    let health = null;
+    try {
+      const r = await fetch('/api/term/health');
+      if (r.ok) health = await r.json();
+    } catch { }
+    setBackend(health ? (health.backend === 'pty' ? 'pty (exec)' : 'pipe (exec)') : 'exec');
+    execRef.current.cwd = '';
+
+    const term = termRef.current;
+    if (!term) return;
+    term.reset();
+    term.writeln('\x1b[2m── webshell exec mode ────────────────────────────\x1b[0m');
+    term.writeln('\x1b[2m Managed host detected: commands run statelessly (no PTY).\x1b[0m');
+    term.writeln('\x1b[2m Interactive apps (vim/htop) need the custom server on a long-running host.\x1b[0m');
+    setStatus('connected');
+    writePrompt();
+    term.focus();
+  }, [writePrompt]);
 
   // ---- SSE fallback transport ----------------------------------------------
   const connectSSE = useCallback(() => {
@@ -190,18 +375,29 @@ export default function Home() {
     ws.onerror = () => { /* onclose decides next step */ };
   }, [connectSSE]);
 
-  const connect = useCallback(() => {
+  const connect = useCallback(async () => {
     if (connectingRef.current) return;
     connectingRef.current = true;
     teardown();
-    const done = () => { connectingRef.current = false; };
     try {
-      if (wsFailedRef.current) connectSSE();
-      else connectWS();
+      // Probe whether the custom server (WS/SSE/PTY) exists on this host.
+      let ptyHost = false;
+      try {
+        const r = await fetch('/api/term/health');
+        if (r.ok) ptyHost = true;
+      } catch { }
+
+      if (!ptyHost) {
+        await connectExec();     // managed host (e.g. Cloudways Velocity)
+      } else if (wsFailedRef.current) {
+        connectSSE();            // PTY host, WS blocked by proxy
+      } else {
+        connectWS();             // PTY host, try WebSocket first
+      }
     } finally {
-      setTimeout(done, 100);
+      connectingRef.current = false;
     }
-  }, [connectWS, connectSSE, teardown]);
+  }, [connectWS, connectSSE, connectExec, teardown]);
 
   // ---- Boot: build terminal, connect, fit, resize handling ----------------
   useEffect(() => {
@@ -244,12 +440,21 @@ export default function Home() {
       fitAddon.fit();
       const dims = { cols: term.cols, rows: term.rows };
       setTermSize(dims);
-      term.onData((data) => sendInput(data));
+      term.onData((data) => {
+        if (transportRef.current === 'exec') handleExecKey(data);
+        else sendInput(data);
+      });
       term.onResize(({ cols, rows }) => {
         setTermSize({ cols, rows });
         sendResize(cols, rows);
       });
       term.focus();
+      // Debug/test hook: lets tests feed xterm onData strings directly
+      window.__webshell = {
+        term,
+        execKey: (d) => handleExecKey(d),
+        sendInput: (d) => sendInput(d),
+      };
       connect();
     })();
 
