@@ -101,11 +101,103 @@ function authOk(headers) {
 app.prepare().then(() => {
   const upgradeHandler = app.getUpgradeHandler();
 
-  const server = http.createServer((req, res) => {
+  // -------------------------------------------------------------------------
+  // SSE fallback transport (works through any proxy — no Upgrade headers needed)
+  // -------------------------------------------------------------------------
+  const sseSessions = new Map();
+  let sseCounter = 0;
+
+  function readJsonBody(req) {
+    return new Promise((resolve) => {
+      let body = '';
+      req.on('data', (c) => {
+        body += c;
+        if (body.length > 1e6) req.destroy(); // sanity cap
+      });
+      req.on('end', () => {
+        try { resolve(JSON.parse(body || '{}')); } catch { resolve({}); }
+      });
+      req.on('error', () => resolve({}));
+    });
+  }
+
+  function sseWrite(res, obj) {
+    try { res.write(`data: ${JSON.stringify(obj)}\n\n`); } catch { /* closed */ }
+  }
+
+  async function handleSse(req, res) {
+    const url = new URL(req.url, 'http://localhost');
+
+    if (url.pathname === '/api/term/health' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({ backend: usingPty ? 'pty' : 'pipe', sse: true }));
+      return;
+    }
+
+    if (url.pathname === '/api/term/sse' && req.method === 'GET') {
+      let session;
+      try {
+        session = createSession(parseInt(url.searchParams.get('cols'), 10) || 80,
+                                parseInt(url.searchParams.get('rows'), 10) || 24);
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `Failed to start shell: ${err.message}` }));
+        return;
+      }
+
+      const id = `sse-${Date.now().toString(36)}-${++sseCounter}`;
+      sseSessions.set(id, { session });
+
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no', // nginx: don't buffer this stream
+      });
+      sseWrite(res, { type: 'hello', id, backend: usingPty ? 'pty' : 'pipe' });
+
+      session.onData((data) => sseWrite(res, { type: 'data', data }));
+      session.onExit((code) => {
+        sseWrite(res, { type: 'exit', code });
+        res.end();
+      });
+
+      const ping = setInterval(() => res.write(': ping\n\n'), 25000);
+      req.on('close', () => {
+        clearInterval(ping);
+        sseSessions.delete(id);
+        session.kill();
+      });
+      return;
+    }
+
+    if (url.pathname === '/api/term/input' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      const rec = sseSessions.get(body.id);
+      if (!rec) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'no such session' }));
+        return;
+      }
+      try {
+        if (body.resize) rec.session.resize(body.resize.cols, body.resize.rows);
+        if (typeof body.data === 'string' && body.data.length) rec.session.write(body.data);
+      } catch { /* session died mid-write */ }
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end('{"ok":true}');
+      return;
+    }
+  }
+
+  const server = http.createServer(async (req, res) => {
     if (!authOk(req.headers)) {
       res.setHeader('WWW-Authenticate', 'Basic realm="webshell"');
       res.statusCode = 401;
       res.end('Unauthorized');
+      return;
+    }
+    if (req.url.startsWith('/api/term/')) {
+      await handleSse(req, res);
       return;
     }
     handle(req, res);

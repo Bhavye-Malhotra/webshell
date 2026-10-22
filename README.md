@@ -8,7 +8,8 @@ A stable, good-looking web-based terminal built with **Next.js**, **node-pty**, 
 
 - **Real PTY terminal** — `node-pty` streams a genuine shell session (`$SHELL`), not a command executor
 - **Full interactivity** — vim, htop, less, interactive prompts, ctrl-c/ctrl-d, 256-color + truecolor
-- **Polished UI** — dark GitHub-style theme, live connection status, terminal size readout
+- **Dual transport** — WebSocket first, automatic **SSE + POST fallback** if a proxy blocks WebSocket upgrades (works through Cloudflare, Cloudways, and other restrictive proxies)
+- **Polished UI** — dark GitHub-style theme, live connection status, transport badge, terminal size readout
 - **Live resize** — terminal refits on window resize and propagates `TIOCSWINSZ` to the shell
 - **Auto reconnection** — session-ended overlay with one-click restart
 - **Opt-in auth** — set `WEBSHELL_USER` + `WEBSHELL_PASS` for HTTP basic auth (also guards the WebSocket)
@@ -44,11 +45,13 @@ npm start
 ```
 server.js              custom Next.js server
 ├─ Next.js             renders the React UI (app router)
-└─ WebSocket /api/term streams a node-pty session (fallback: piped shell)
+├─ WebSocket /api/term streams a node-pty session (fallback: piped shell)
+└─ SSE fallback        GET /api/term/sse (output) + POST /api/term/input (input)
+                       used automatically when WebSocket upgrades are blocked
 
 app/
 ├─ layout.js           loads xterm.css + globals.css
-├─ page.js             "use client" — xterm.js terminal, WebSocket client
+├─ page.js             "use client" — xterm.js terminal, WS + SSE client
 └─ globals.css         dark theme, titlebar, statusbar, overlay
 ```
 
@@ -56,6 +59,16 @@ Protocol (JSON over WebSocket, both directions):
 
 - client → server: `{type: "hello"}`, `{type: "start", cols, rows}`, `{type: "input", data}`, `{type: "resize", cols, rows}`
 - server → client: `{type: "backend", backend}`, `{type: "data", data}`, `{type: "exit", code}`
+
+## Deploying behind proxies (Cloudways, Cloudflare, nginx, …)
+
+The client tries a WebSocket first and silently falls back to **SSE (`/api/term/sse`) + POST (`/api/term/input`)** if upgrades are blocked — no proxy config required for the fallback to work. The titlebar badge shows the active transport.
+
+Checklist for the WebSocket path to work:
+
+1. **Run the custom server** — startup command must be `npm start` (`node server.js`), *not* `next start`. `next start` has no WebSocket endpoint and `/api/term` will 404.
+2. **Bind reachable** — set `HOST=0.0.0.0` if your proxy doesn't reach the app on `127.0.0.1`.
+3. **Proxy upgrades** — nginx needs `proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; proxy_http_version 1.1;` in front of the Node app.
 
 ## Security notes
 
