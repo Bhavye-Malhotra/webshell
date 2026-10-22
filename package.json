@@ -1,0 +1,24 @@
+{
+  "name": "webshell",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A stable, good-looking web-based terminal built with Next.js + node-pty",
+  "scripts": {
+    "dev": "node server.js",
+    "build": "next build",
+    "start": "NODE_ENV=production node server.js",
+    "lint": "next lint"
+  },
+  "engines": {
+    "node": ">=18.18"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "next": "^15.1.6",
+    "node-pty": "^1.2.0-beta.15",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "ws": "^8.18.0"
+  }
+}
